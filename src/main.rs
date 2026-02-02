@@ -1,8 +1,11 @@
+mod reliable_service;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
+use reliable_service::ReliableService;
 
 // ============== PACKET TYPE ==============
 
@@ -94,6 +97,7 @@ pub struct AlliumClient {
     udp: Option<Arc<UdpSocket>>,
     server_ep: Option<SocketAddr>,
     running: Arc<Mutex<bool>>,
+    reliable: Option<Arc<Mutex<ReliableService>>>,
 }
 
 impl AlliumClient {
@@ -106,11 +110,11 @@ impl AlliumClient {
             udp: None,
             server_ep: None,
             running: Arc::new(Mutex::new(false)),
+            reliable: None,
         }
     }
     
 	pub async fn connect_async(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-		// Force IPv4 for localhost to match server
 		let host = if self.host == "localhost" {
 			"127.0.0.1"
 		} else {
@@ -128,6 +132,9 @@ impl AlliumClient {
 			"0.0.0.0:0"
 		};
 		let udp = UdpSocket::bind(bind_addr).await?;
+		let udp = Arc::new(udp);
+		
+		let reliable = Arc::new(Mutex::new(ReliableService::new(server_ep, udp.clone())));
 		
 		let packet = PacketBuilder::build_text(&format!("HELLO:{}", self.local.name));
 		udp.send_to(&packet, server_ep).await?;
@@ -135,17 +142,29 @@ impl AlliumClient {
 		println!("[CLIENT] {} connecting to {}", self.local.name, server_ep);
 		
 		self.server_ep = Some(server_ep);
-		self.udp = Some(Arc::new(udp));
+		self.udp = Some(udp.clone());
+		self.reliable = Some(reliable.clone());
 		*self.running.lock().await = true;
 		
-		// Start receive loop
-		let udp_clone = self.udp.as_ref().unwrap().clone();
 		let running_clone = self.running.clone();
 		let remotes_clone = self.remotes.clone();
 		let mut local_clone = self.local.clone();
+		let reliable_clone = reliable.clone();
 		
 		tokio::spawn(async move {
-			Self::receive_loop(udp_clone, running_clone, remotes_clone, &mut local_clone).await;
+			Self::receive_loop(udp.clone(), running_clone, remotes_clone, &mut local_clone, reliable_clone).await;
+		});
+		
+		let running_clone = self.running.clone();
+		tokio::spawn(async move {
+			while *running_clone.lock().await {
+				tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+				let mut rs = reliable.lock().await;
+				if let Err(e) = rs.tick().await {
+					eprintln!("[CLIENT] Reliable error: {}", e);
+					break;
+				}
+			}
 		});
 		
 		Ok(())
@@ -159,21 +178,42 @@ impl AlliumClient {
         Ok(())
     }
     
+    pub async fn send_reliable(&self, msg: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(reliable) = &self.reliable {
+            let payload = format!("MSG:{}", msg).into_bytes();
+            reliable.lock().await.send(payload).await?;
+        }
+        Ok(())
+    }
+    
     async fn receive_loop(
         udp: Arc<UdpSocket>,
         running: Arc<Mutex<bool>>,
         remotes: Arc<Mutex<HashMap<i32, RemoteParticipant>>>,
         local: &mut LocalParticipant,
+        reliable: Arc<Mutex<ReliableService>>,
     ) {
         let mut buf = [0u8; 2048];
         
         while *running.lock().await {
             match udp.recv_from(&mut buf).await {
                 Ok((len, _addr)) => {
-                    if let Ok((packet_type, payload)) = PacketParser::parse(&buf[..len]) {
-                        if packet_type == PacketType::TextMessage {
+                    if len < 1 { continue; }
+                    
+                    let packet_type = buf[0];
+                    
+                    if packet_type == 0x10 || packet_type == 0x11 {
+                        let mut rs = reliable.lock().await;
+                        if let Ok(Some(payload)) = rs.handle_incoming(&buf[..len]).await {
                             let msg = String::from_utf8_lossy(&payload).to_string();
                             Self::handle_message(msg, local, &remotes).await;
+                        }
+                    } else {
+                        if let Ok((packet_type, payload)) = PacketParser::parse(&buf[..len]) {
+                            if packet_type == PacketType::TextMessage {
+                                let msg = String::from_utf8_lossy(&payload).to_string();
+                                Self::handle_message(msg, local, &remotes).await;
+                            }
                         }
                     }
                 }
@@ -241,11 +281,14 @@ impl AlliumClient {
     }
     
     pub async fn disconnect_async(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let (Some(udp), Some(server_ep)) = (&self.udp, &self.server_ep) {
-            let packet = PacketBuilder::build_text("BYE");
-            udp.send_to(&packet, server_ep).await?;
-            *self.running.lock().await = false;
+        if let Some(reliable) = &self.reliable {
+            let payload = "BYE".as_bytes().to_vec();
+            reliable.lock().await.send(payload).await.map_err(|e| e.to_string())?;
+            
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
+        
+        *self.running.lock().await = false;
         Ok(())
     }
 }
@@ -262,6 +305,7 @@ pub struct AlliumServer {
     next_id: Arc<Mutex<i32>>,
     udp: Option<Arc<UdpSocket>>,
     running: Arc<Mutex<bool>>,
+    reliable_connections: Arc<Mutex<HashMap<i32, ReliableService>>>,
 }
 
 impl AlliumServer {
@@ -278,51 +322,113 @@ impl AlliumServer {
             next_id: Arc::new(Mutex::new(1)),
             udp: None,
             running: Arc::new(Mutex::new(false)),
+            reliable_connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     
     pub async fn start_async(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let udp = UdpSocket::bind(format!("0.0.0.0:{}", self.port)).await?;
+        let udp = Arc::new(udp);
         println!("[SERVER] '{}' started on {}", self.local.name, self.port);
         
-        self.udp = Some(Arc::new(udp));
+        self.udp = Some(udp.clone());
         *self.running.lock().await = true;
         
-        let udp_clone = self.udp.as_ref().unwrap().clone();
-        let running_clone = self.running.clone();
-        let remotes_clone = self.remotes.clone();
-        let addr_to_id_clone = self.addr_to_id.clone();
-        let id_to_addr_clone = self.id_to_addr.clone();
-        let next_id_clone = self.next_id.clone();
-        let local_clone = self.local.clone();
+        let running = self.running.clone();
+        let remotes = self.remotes.clone();
+        let addr_to_id = self.addr_to_id.clone();
+        let id_to_addr = self.id_to_addr.clone();
+        let next_id = self.next_id.clone();
+        let local = self.local.clone();
+        let reliable_connections = self.reliable_connections.clone();
         
         let mut buf = [0u8; 2048];
         
-        while *running_clone.lock().await {
-            match udp_clone.recv_from(&mut buf).await {
-                Ok((len, addr)) => {
-                    if let Ok((packet_type, payload)) = PacketParser::parse(&buf[..len]) {
-                        if packet_type == PacketType::TextMessage {
-                            let msg = String::from_utf8_lossy(&payload).to_string();
-                            Self::handle_message(
-                                msg,
-                                addr,
-                                &udp_clone,
-                                &remotes_clone,
-                                &addr_to_id_clone,
-                                &id_to_addr_clone,
-                                &next_id_clone,
-                                &local_clone,
-                            )
-                            .await;
+        loop {
+            tokio::select! {
+                Ok((len, addr)) = udp.recv_from(&mut buf) => {
+                    if len < 1 { continue; }
+                    
+                    let packet_type = buf[0];
+                    
+                    if packet_type == 0x10 || packet_type == 0x11 {
+                        let key = addr.to_string();
+                        let addr_to_id_lock = addr_to_id.lock().await;
+                        
+                        if let Some(&client_id) = addr_to_id_lock.get(&key) {
+                            drop(addr_to_id_lock);
+                            
+                            let mut reliable_lock = reliable_connections.lock().await;
+                            if let Some(rs) = reliable_lock.get_mut(&client_id) {
+                                if let Ok(Some(payload)) = rs.handle_incoming(&buf[..len]).await {
+                                    let msg = String::from_utf8_lossy(&payload).to_string();
+                                    
+                                    let should_disconnect = Self::handle_reliable_message_locked(
+                                        client_id,
+                                        msg,
+                                        &remotes,
+                                        &mut *reliable_lock,
+                                    ).await;
+                                    
+                                    drop(reliable_lock);
+                                    
+                                    if should_disconnect {
+                                        remotes.lock().await.remove(&client_id);
+                                        addr_to_id.lock().await.remove(&key);
+                                        id_to_addr.lock().await.remove(&client_id);
+                                        reliable_connections.lock().await.remove(&client_id);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        if let Ok((packet_type, payload)) = PacketParser::parse(&buf[..len]) {
+                            if packet_type == PacketType::TextMessage {
+                                let msg = String::from_utf8_lossy(&payload).to_string();
+                                Self::handle_message(
+                                    msg,
+                                    addr,
+                                    &udp,
+                                    &remotes,
+                                    &addr_to_id,
+                                    &id_to_addr,
+                                    &next_id,
+                                    &local,
+                                    &reliable_connections,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
-                Err(_) => {
-                    if *running_clone.lock().await {
-                        break;
+                
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {
+                    let mut reliable_lock = reliable_connections.lock().await;
+                    let mut dead_clients = Vec::new();
+                    
+                    for (client_id, rs) in reliable_lock.iter_mut() {
+                        if let Err(_) = rs.tick().await {
+                            dead_clients.push(*client_id);
+                        }
+                    }
+                    
+                    for client_id in dead_clients {
+                        reliable_lock.remove(&client_id);
+                        
+                        remotes.lock().await.remove(&client_id);
+                        id_to_addr.lock().await.remove(&client_id);
+                        
+                        let mut addr_to_id_lock = addr_to_id.lock().await;
+                        addr_to_id_lock.retain(|_, &mut id| id != client_id);
+                        drop(addr_to_id_lock);
+                        
+                        eprintln!("[SERVER] Client {} reliable timeout", client_id);
                     }
                 }
+            }
+            
+            if !*running.lock().await {
+                break;
             }
         }
         
@@ -338,6 +444,7 @@ impl AlliumServer {
         id_to_addr: &Arc<Mutex<HashMap<i32, SocketAddr>>>,
         next_id: &Arc<Mutex<i32>>,
         local: &LocalParticipant,
+        reliable_connections: &Arc<Mutex<HashMap<i32, ReliableService>>>,
     ) {
         let parts: Vec<&str> = msg.splitn(2, ':').collect();
         let key = addr.to_string();
@@ -357,12 +464,13 @@ impl AlliumServer {
                 addr_to_id.lock().await.insert(key, id);
                 id_to_addr.lock().await.insert(id, addr);
                 
-                // Send WELCOME
+                let rs = ReliableService::new(addr, udp.clone());
+                reliable_connections.lock().await.insert(id, rs);
+                
                 let packet = PacketBuilder::build_text(&format!("WELCOME:{}", id));
                 let _ = udp.send_to(&packet, addr).await;
                 println!("[SERVER] Sent WELCOME:{} to {}", id, addr);
                 
-                // Broadcast JOIN
                 Self::broadcast(
                     &PacketBuilder::build_text(&format!("JOIN:{}:{}", id, name)),
                     udp,
@@ -371,7 +479,6 @@ impl AlliumServer {
                 )
                 .await;
                 
-                // Send server JOIN
                 let packet = PacketBuilder::build_text(&format!(
                     "JOIN:{}:{}",
                     local.id.unwrap(),
@@ -379,7 +486,6 @@ impl AlliumServer {
                 ));
                 let _ = udp.send_to(&packet, addr).await;
                 
-                // Send all other clients
                 let remotes_lock = remotes.lock().await;
                 for (oid, other) in remotes_lock.iter() {
                     if *oid != id {
@@ -424,6 +530,7 @@ impl AlliumServer {
                     remotes.lock().await.remove(&cid);
                     addr_to_id.lock().await.remove(&key);
                     id_to_addr.lock().await.remove(&cid);
+                    reliable_connections.lock().await.remove(&cid);
                     
                     Self::broadcast(
                         &PacketBuilder::build_text(&format!("LEFT:{}", cid)),
@@ -435,6 +542,49 @@ impl AlliumServer {
                 }
             }
             _ => {}
+        }
+    }
+    
+    async fn handle_reliable_message_locked(
+        from_id: i32,
+        msg: String,
+        remotes: &Arc<Mutex<HashMap<i32, RemoteParticipant>>>,
+        reliable_lock: &mut HashMap<i32, ReliableService>,
+    ) -> bool {
+        let parts: Vec<&str> = msg.splitn(2, ':').collect();
+        
+        if parts[0] == "MSG" && parts.len() == 2 {
+            let remotes_lock = remotes.lock().await;
+            if let Some(sender) = remotes_lock.get(&from_id) {
+                println!("[SERVER] {}: {}", sender.name, parts[1]);
+            }
+            drop(remotes_lock);
+            
+            let payload = format!("MSG:{}:{}", from_id, parts[1]).into_bytes();
+            
+            for (client_id, rs) in reliable_lock.iter_mut() {
+                if *client_id != from_id {
+                    let _ = rs.send(payload.clone()).await;
+                }
+            }
+            false
+        } else if parts[0] == "BYE" {
+            let remotes_lock = remotes.lock().await;
+            if let Some(remote) = remotes_lock.get(&from_id) {
+                println!("[SERVER] {} left", remote.name);
+            }
+            drop(remotes_lock);
+            
+            let payload = format!("LEFT:{}", from_id).into_bytes();
+            for (client_id, rs) in reliable_lock.iter_mut() {
+                if *client_id != from_id {
+                    let _ = rs.send(payload.clone()).await;
+                }
+            }
+            
+            true
+        } else {
+            false
         }
     }
     
@@ -475,16 +625,16 @@ async fn main() {
     c2.connect_async().await.unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     
-    c1.send_message_async("Hello everyone!").await.unwrap();
+    c1.send_reliable("Hello everyone!").await.unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     
-    c2.send_message_async("Hi Nika!").await.unwrap();
+    c2.send_reliable("Hi Nika!").await.unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     
     c1.disconnect_async().await.unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     
-    c2.send_message_async("Where did Nika go?").await.unwrap();
+    c2.send_reliable("Where did Nika go?").await.unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     
     c2.disconnect_async().await.unwrap();
