@@ -204,10 +204,12 @@ impl AlliumClient {
                     
                     if packet_type == 0x10 || packet_type == 0x11 {
                         let mut rs = reliable.lock().await;
-                        if let Ok(Some(payload)) = rs.handle_incoming(&buf[..len]).await {
-                            let msg = String::from_utf8_lossy(&payload).to_string();
-                            Self::handle_message(msg, local, &remotes).await;
-                        }
+						if let Ok(payloads) = rs.handle_incoming(&buf[..len]).await {
+							for payload in payloads {
+								let msg = String::from_utf8_lossy(&payload).to_string();
+								Self::handle_message(msg, local, &remotes).await;
+							}
+						}
                     } else {
                         if let Ok((packet_type, payload)) = PacketParser::parse(&buf[..len]) {
                             if packet_type == PacketType::TextMessage {
@@ -358,28 +360,33 @@ impl AlliumServer {
                         if let Some(&client_id) = addr_to_id_lock.get(&key) {
                             drop(addr_to_id_lock);
                             
-                            let mut reliable_lock = reliable_connections.lock().await;
-                            if let Some(rs) = reliable_lock.get_mut(&client_id) {
-                                if let Ok(Some(payload)) = rs.handle_incoming(&buf[..len]).await {
-                                    let msg = String::from_utf8_lossy(&payload).to_string();
-                                    
-                                    let should_disconnect = Self::handle_reliable_message_locked(
-                                        client_id,
-                                        msg,
-                                        &remotes,
-                                        &mut *reliable_lock,
-                                    ).await;
-                                    
-                                    drop(reliable_lock);
-                                    
-                                    if should_disconnect {
-                                        remotes.lock().await.remove(&client_id);
-                                        addr_to_id.lock().await.remove(&key);
-                                        id_to_addr.lock().await.remove(&client_id);
-                                        reliable_connections.lock().await.remove(&client_id);
-                                    }
-                                }
-                            }
+							let mut reliable_lock = reliable_connections.lock().await;
+							if let Some(rs) = reliable_lock.get_mut(&client_id) {
+								if let Ok(payloads) = rs.handle_incoming(&buf[..len]).await {
+									drop(reliable_lock);
+									
+									for payload in payloads {
+										let msg = String::from_utf8_lossy(&payload).to_string();
+										
+										let mut reliable_lock = reliable_connections.lock().await;
+										let should_disconnect = Self::handle_reliable_message_locked(
+											client_id,
+											msg,
+											&remotes,
+											&mut *reliable_lock,
+										).await;
+										drop(reliable_lock);
+										
+										if should_disconnect {
+											remotes.lock().await.remove(&client_id);
+											addr_to_id.lock().await.remove(&key);
+											id_to_addr.lock().await.remove(&client_id);
+											reliable_connections.lock().await.remove(&client_id);
+											break;
+										}
+									}
+								}
+							}
                         }
                     } else {
                         if let Ok((packet_type, payload)) = PacketParser::parse(&buf[..len]) {
