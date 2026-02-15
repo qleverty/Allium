@@ -29,6 +29,7 @@ pub struct ReliableService {
     out_of_order_buffer: HashMap<u32, Vec<u8>>,
     last_activity: Instant,
 	fragment_assembler: HashMap<u32, PartialMessage>,
+	pending_acks: Vec<u32>,
 }
 
 struct PendingPacket {
@@ -76,6 +77,7 @@ impl ReliableService {
 			out_of_order_buffer: HashMap::new(),
 			last_activity: Instant::now(),
 			fragment_assembler: HashMap::new(),
+			pending_acks: Vec::new(),
 		}
 	}
 
@@ -148,6 +150,14 @@ impl ReliableService {
 		
 		Ok(())
 	}
+	
+async fn enqueue_ack(&mut self, seq: u32) -> Result<(), String> {
+    self.pending_acks.push(seq);
+    if self.pending_acks.len() >= 300 {
+        self.flush_acks().await?;
+    }
+    Ok(())
+}
 
 pub async fn handle_incoming(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     self.last_activity = Instant::now();
@@ -169,12 +179,12 @@ pub async fn handle_incoming(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, S
             self.received_seqs.retain(|_, time| *time > cutoff);
 
             if self.received_seqs.contains_key(&seq) {
-                self.send_ack(seq).await?;
+                self.enqueue_ack(seq).await?;
                 return Ok(Vec::new());
             }
 
             self.received_seqs.insert(seq, Instant::now());
-            self.send_ack(seq).await?;
+            self.enqueue_ack(seq).await?;
 
             let order_id = u32::from_be_bytes([packet[5], packet[6], packet[7], packet[8]]);
             let payload = packet[9..].to_vec();
@@ -212,12 +222,12 @@ pub async fn handle_incoming(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, S
 			self.received_seqs.retain(|_, time| *time > cutoff);
 			
 			if self.received_seqs.contains_key(&seq) {
-				self.send_ack(seq).await?;
+				self.enqueue_ack(seq).await?;
 				return Ok(Vec::new());
 			}
-			
+
 			self.received_seqs.insert(seq, Instant::now());
-			self.send_ack(seq).await?;
+			self.enqueue_ack(seq).await?;
 			
 			let order_id = u32::from_be_bytes([packet[5], packet[6], packet[7], packet[8]]);
 			let total_fragments = u16::from_be_bytes([packet[9], packet[10]]);
@@ -271,31 +281,36 @@ pub async fn handle_incoming(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, S
 		}
 		
 		RELIABLE_ACK => {
-			if self.outgoing.remove(&seq).is_some() {
-				println!("[RELIABLE] Received ACK seq={} from {} (removed from outgoing)", 
-					seq, self.remote_addr);
-			} else {
-				println!("[RELIABLE] Received ACK seq={} from {} (NOT in outgoing!)", 
-					seq, self.remote_addr);
+			let count = (packet.len() - 1) / 4;
+			for i in 0..count {
+				let o = 1 + i * 4;
+				let s = u32::from_be_bytes([packet[o], packet[o+1], packet[o+2], packet[o+3]]);
+				if self.outgoing.remove(&s).is_some() {
+					println!("[RELIABLE] ACK seq={} from {}", s, self.remote_addr);
+				}
 			}
 			Ok(Vec::new())
 		}
         _ => Err("unknown reliable packet type".to_string())
     }
 }
-
-	async fn send_ack(&self, seq: u32) -> Result<(), String> {
+	
+	async fn flush_acks(&mut self) -> Result<(), String> {
+		if self.pending_acks.is_empty() { return Ok(()); }
 		let mut packet = vec![RELIABLE_ACK];
-		packet.extend_from_slice(&seq.to_be_bytes());
+		for seq in self.pending_acks.drain(..) {
+			packet.extend_from_slice(&seq.to_be_bytes());
+		}
 		self.udp.send_to(&packet, self.remote_addr).await.map_err(|e| e.to_string())?;
-		println!("[RELIABLE] Sent ACK seq={} to {} (from local_addr: {:?})", 
-			seq, self.remote_addr, self.udp.local_addr());
+		println!("[RELIABLE] Sent ACK ({} seqs) to {}", (packet.len() - 1) / 4, self.remote_addr);
 		Ok(())
 	}
 
 	pub async fn tick(&mut self) -> Result<(), String> {
 		let now = Instant::now();
 		let timeout = Duration::from_millis(self.config.retransmit_timeout_ms);
+		
+		self.flush_acks().await?;
 
 		let cutoff = now - Duration::from_secs(self.config.old_seq_cleanup_secs);
 		self.received_seqs.retain(|_, time| *time > cutoff);
