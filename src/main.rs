@@ -5,15 +5,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use reliable_service::ReliableService;
 
 // ============== PACKET TYPE ==============
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(u8)]
-pub enum PacketType {
-    TextMessage = 0,
-}
+pub const AUDIO: u8 = 0x00;
+pub const VIDEO: u8 = 0x01;
+
+use reliable_service::{ReliableService, RELIABLE_DATA, RELIABLE_ACK, RELIABLE_FRAGMENTED};
 
 // ============== PACKET BUILDER ==============
 
@@ -25,7 +23,7 @@ impl PacketBuilder {
         let length = data.len() as u32;
         
         let mut packet = Vec::with_capacity(5 + data.len());
-        packet.push(PacketType::TextMessage as u8);
+        packet.push(0xFF);
         packet.push((length >> 24) as u8);
         packet.push(((length >> 16) & 0xFF) as u8);
         packet.push(((length >> 8) & 0xFF) as u8);
@@ -41,7 +39,7 @@ impl PacketBuilder {
 pub struct PacketParser;
 
 impl PacketParser {
-    pub fn parse(packet: &[u8]) -> Result<(PacketType, Vec<u8>), String> {
+    pub fn parse(packet: &[u8]) -> Result<Vec<u8>, String> {
         if packet.len() < 5 {
             return Err("Packet too short".to_string());
         }
@@ -54,7 +52,7 @@ impl PacketParser {
         let mut payload = vec![0u8; length as usize];
         payload.copy_from_slice(&packet[5..5 + length as usize]);
         
-        Ok((PacketType::TextMessage, payload))
+        Ok(payload)
     }
 }
 
@@ -193,7 +191,7 @@ impl AlliumClient {
         local: &mut LocalParticipant,
         reliable: Arc<Mutex<ReliableService>>,
     ) {
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; 65535];
         
         while *running.lock().await {
             match udp.recv_from(&mut buf).await {
@@ -202,7 +200,7 @@ impl AlliumClient {
                     
                     let packet_type = buf[0];
                     
-                    if packet_type == 0x10 || packet_type == 0x11 {
+                    if packet_type == RELIABLE_DATA || packet_type == RELIABLE_ACK || packet_type == RELIABLE_FRAGMENTED {
                         let mut rs = reliable.lock().await;
 						if let Ok(payloads) = rs.handle_incoming(&buf[..len]).await {
 							for payload in payloads {
@@ -211,12 +209,10 @@ impl AlliumClient {
 							}
 						}
                     } else {
-                        if let Ok((packet_type, payload)) = PacketParser::parse(&buf[..len]) {
-                            if packet_type == PacketType::TextMessage {
-                                let msg = String::from_utf8_lossy(&payload).to_string();
-                                Self::handle_message(msg, local, &remotes).await;
-                            }
-                        }
+                        if let Ok(payload) = PacketParser::parse(&buf[..len]) {
+							let msg = String::from_utf8_lossy(&payload).to_string();
+							Self::handle_message(msg, local, &remotes).await;
+						}
                     }
                 }
                 Err(_) => {
@@ -352,8 +348,16 @@ impl AlliumServer {
                     if len < 1 { continue; }
                     
                     let packet_type = buf[0];
+					
+					if packet_type == AUDIO {
+						// audio
+					}
+					
+					else if packet_type == VIDEO {
+						// video
+					}
                     
-                    if packet_type == 0x10 || packet_type == 0x11 {
+                    else if packet_type == RELIABLE_DATA || packet_type == RELIABLE_ACK || packet_type == RELIABLE_FRAGMENTED {
                         let key = addr.to_string();
                         let addr_to_id_lock = addr_to_id.lock().await;
                         
@@ -389,23 +393,21 @@ impl AlliumServer {
 							}
                         }
                     } else {
-                        if let Ok((packet_type, payload)) = PacketParser::parse(&buf[..len]) {
-                            if packet_type == PacketType::TextMessage {
-                                let msg = String::from_utf8_lossy(&payload).to_string();
-                                Self::handle_message(
-                                    msg,
-                                    addr,
-                                    &udp,
-                                    &remotes,
-                                    &addr_to_id,
-                                    &id_to_addr,
-                                    &next_id,
-                                    &local,
-                                    &reliable_connections,
-                                )
-                                .await;
-                            }
-                        }
+                        if let Ok(payload) = PacketParser::parse(&buf[..len]) {
+							let msg = String::from_utf8_lossy(&payload).to_string();
+							Self::handle_message(
+								msg,
+								addr,
+								&udp,
+								&remotes,
+								&addr_to_id,
+								&id_to_addr,
+								&next_id,
+								&local,
+								&reliable_connections,
+							)
+							.await;
+						}
                     }
                 }
                 
@@ -636,6 +638,16 @@ async fn main() {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     
     c2.send_reliable("Hi Nika!").await.unwrap();
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+	
+    let big = "X".repeat(3500);
+    let preview = format!("{}...{}", &big[..20], &big[big.len()-20..]);
+    println!("[TEST] Nika sends fragmented ({} bytes): {}", big.len(), preview);
+    c1.send_reliable(&big).await.unwrap();
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    println!("[TEST] Nika sends ordered after fragmented: \"ping\"");
+    c1.send_reliable("ping").await.unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     
     c1.disconnect_async().await.unwrap();
