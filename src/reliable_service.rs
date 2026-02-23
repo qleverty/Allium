@@ -24,7 +24,8 @@ pub struct ReliableService {
     outgoing: HashMap<u32, PendingPacket>,
     next_seq: u32,
     next_order_id: u32,
-    received_seqs: HashMap<u32, Instant>,
+    last_received_seq: u32,
+    received_mask: u128,
     next_expected_order_id: u32,
     out_of_order_buffer: HashMap<u32, Vec<u8>>,
     last_activity: Instant,
@@ -43,7 +44,6 @@ struct PendingPacket {
 pub struct ReliableConfig {
     pub retransmit_timeout_ms: u64,
     pub max_attempts: u32,
-    pub old_seq_cleanup_secs: u64,
     // TODO: Add dynamic RTT calculation based on ACK timing
     // TODO: Add max_packet_size for automatic fragmentation
     // TODO: Add congestion control based on packet loss rate
@@ -54,7 +54,6 @@ impl Default for ReliableConfig {
         Self {
             retransmit_timeout_ms: 100,
             max_attempts: 3,
-            old_seq_cleanup_secs: 30,
         }
     }
 }
@@ -72,12 +71,39 @@ impl ReliableService {
 			outgoing: HashMap::new(),
 			next_seq: 0,
 			next_order_id: 0,
-			received_seqs: HashMap::new(),
+			last_received_seq: 0,
+			received_mask: 0,
 			next_expected_order_id: 0,
 			out_of_order_buffer: HashMap::new(),
 			last_activity: Instant::now(),
 			fragment_assembler: HashMap::new(),
 			pending_acks: Vec::new(),
+		}
+	}
+
+	fn is_duplicate(&self, seq: u32) -> bool {
+		let offset = self.last_received_seq.wrapping_sub(seq);
+		if offset > (1u32 << 31) {
+			return false;
+		}
+		if offset >= 128 {
+			return true;
+		}
+		(self.received_mask & (1u128 << offset)) != 0
+	}
+
+	fn mark_received(&mut self, seq: u32) {
+		let offset = self.last_received_seq.wrapping_sub(seq);
+		if offset > (1u32 << 31) {
+			let shift = seq.wrapping_sub(self.last_received_seq);
+			if shift >= 128 {
+				self.received_mask = 1;
+			} else {
+				self.received_mask = (self.received_mask << shift) | 1;
+			}
+			self.last_received_seq = seq;
+		} else if offset < 128 {
+			self.received_mask |= 1u128 << offset;
 		}
 	}
 
@@ -174,16 +200,13 @@ pub async fn handle_incoming(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, S
             if packet.len() < 9 {
                 return Err("ReliableOrdered packet too short".to_string());
             }
-			
-            let cutoff = Instant::now() - Duration::from_secs(self.config.old_seq_cleanup_secs);
-            self.received_seqs.retain(|_, time| *time > cutoff);
 
-            if self.received_seqs.contains_key(&seq) {
+            if self.is_duplicate(seq) {
                 self.enqueue_ack(seq).await?;
                 return Ok(Vec::new());
             }
 
-            self.received_seqs.insert(seq, Instant::now());
+            self.mark_received(seq);
             self.enqueue_ack(seq).await?;
 
             let order_id = u32::from_be_bytes([packet[5], packet[6], packet[7], packet[8]]);
@@ -218,15 +241,12 @@ pub async fn handle_incoming(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, S
 				return Err("ReliableFragmented packet too short".to_string());
 			}
 			
-			let cutoff = Instant::now() - Duration::from_secs(self.config.old_seq_cleanup_secs);
-			self.received_seqs.retain(|_, time| *time > cutoff);
-			
-			if self.received_seqs.contains_key(&seq) {
+			if self.is_duplicate(seq) {
 				self.enqueue_ack(seq).await?;
 				return Ok(Vec::new());
 			}
 
-			self.received_seqs.insert(seq, Instant::now());
+			self.mark_received(seq);
 			self.enqueue_ack(seq).await?;
 			
 			let order_id = u32::from_be_bytes([packet[5], packet[6], packet[7], packet[8]]);
@@ -312,9 +332,6 @@ pub async fn handle_incoming(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, S
 		
 		self.flush_acks().await?;
 
-		let cutoff = now - Duration::from_secs(self.config.old_seq_cleanup_secs);
-		self.received_seqs.retain(|_, time| *time > cutoff);
-
 		let mut failed_seqs = Vec::new();
 
 		let to_resend: Vec<(u32, Vec<u8>)> = self.outgoing
@@ -364,6 +381,6 @@ pub async fn handle_incoming(&mut self, packet: &[u8]) -> Result<Vec<Vec<u8>>, S
 
     #[allow(dead_code)]
     pub fn stats(&self) -> (usize, usize) {
-        (self.outgoing.len(), self.received_seqs.len())
+        (self.outgoing.len(), self.received_mask.count_ones() as usize)
     }
 }
